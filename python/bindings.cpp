@@ -15,30 +15,48 @@
 
 #include "kernels.h"
 
-torch::Tensor gemm_naive(
-    torch::Tensor a,
-    torch::Tensor b
+// Write output to tensor c
+void gemm_naive(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    torch::Tensor& c
 ) {
-    // Input validation
-    TORCH_CHECK(a.device().is_cuda(), "Input tensor a must be a CUDA tensor");
-    TORCH_CHECK(b.device().is_cuda(), "Input tensor b must be a CUDA tensor");
-    TORCH_CHECK(a.device() == b.device(), "Inputs must be on the same device");
-    TORCH_CHECK(a.is_contiguous(), "Input tensor a must be contiguous");
-    TORCH_CHECK(b.is_contiguous(), "Input tensor b must be contiguous");
-    TORCH_CHECK(a.dtype() == torch::kFloat32, "Input tensor a must be float32");
-    TORCH_CHECK(b.dtype() == torch::kFloat32, "Input tensor b must be float32");
-    TORCH_CHECK(a.sizes() == b.sizes(), "Input tensors must have the same shape");
+    TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda(),
+                "All tensors must be CUDA tensors");
+
+    TORCH_CHECK(a.device() == b.device() && a.device() == c.device(),
+                "All tensors must be on the same device");
+
+    TORCH_CHECK(a.scalar_type() == torch::kFloat32 &&
+                b.scalar_type() == torch::kFloat32 &&
+                c.scalar_type() == torch::kFloat32,
+                "All tensors must be float32");
+
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && c.dim() == 2,
+                "All tensors must be 2D");
+
+    TORCH_CHECK(a.size(0) == a.size(1),
+                "Matrices must be square");
+
+    TORCH_CHECK(a.sizes() == b.sizes() && a.sizes() == c.sizes(),
+                "Matrix dimensions must match");
+
+    TORCH_CHECK(a.is_contiguous() &&
+                b.is_contiguous() &&
+                c.is_contiguous(),
+                "All tensors must be contiguous");
+
+    TORCH_CHECK(a.size(0) <= std::numeric_limits<int>::max(),
+                "Matrix dimension exceeds supported range");
 
     TORCH_CHECK(
-        a.numel() <= std::numeric_limits<int>::max(),
-        "Too many elements"
+        !a.is_alias_of(c) && !b.is_alias_of(c),
+        "Output must not alias an input tensor"
     );
 
     // Ensure that the active CUDA device matches tensor a
     c10::cuda::CUDAGuard guard(a.device());
 
-    // Create the output tensor on the same device as the input
-    auto c = torch::empty_like(a);
     auto stream = at::cuda::getCurrentCUDAStream();
 
     if (a.numel() > 0) {
@@ -53,8 +71,6 @@ torch::Tensor gemm_naive(
         // Throws if the kernel launch produced an error
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-
-    return c;
 }
 
 // Binding function to expose C++ functions in Python

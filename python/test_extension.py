@@ -8,15 +8,15 @@ def main():
 
     a = torch.randn(256, 256, device="cuda")
     b = torch.randn(256, 256, device="cuda")
+    c = torch.empty_like(a)
 
     # Test multiplication
-    # TODO: create an outparameter version of this, so that we can more accurately benchmark
-    result_multiply = cuda_ops.gemm_naive(a, b)
-    torch.testing.assert_close(result_multiply, a @ b, rtol=1e-4, atol=1e-4 )
+    cuda_ops.gemm_naive(a, b, c)
+    torch.testing.assert_close(c, a @ b, rtol=1e-4, atol=1e-4 )
 
     print("Passed!")
-    print("Device:", result_multiply.device)
-    print("Shape:", result_multiply.shape)
+    print("Device:", c.device)
+    print("Shape:", c.shape)
 
 if __name__ == "__main__":
     main()
