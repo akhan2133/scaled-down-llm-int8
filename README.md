@@ -4,6 +4,13 @@
 
 Based on [LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale](https://arxiv.org/abs/2208.07339) (Dettmers et al., NeurIPS 2022).
 
+## Quickstart
+```bash
+bash setup.sh
+source /tmp/${USER}-llm-int8-venv/bin/activate
+python src/main.py
+```
+
 ## Overview
 
 This project explores the performance, memory efficiency, and numerical accuracy of INT8 matrix multiplication for transformer inference on NVIDIA RTX 2000 Ada GPUs.
@@ -51,7 +58,14 @@ LLM-int8/
 ├── README.md
 ├── requirements.txt
 ├── setup.sh
+├── include/
+    └── kernels.h
+├── python/
+    ├── cuda_bindings.cpp
+    └── extension.py
 └── src/
+    ├── kernels/
+        └── gemm_naive.cu
     ├── cuda_matmul_baseline.cpp
     └── main.py
 ```
