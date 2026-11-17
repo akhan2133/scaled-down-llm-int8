@@ -26,16 +26,19 @@ We will then investigate CUDA optimizations to reduce overhead from quantization
 
 ### Python / PyTorch (`src/main.py`)
 
-Implements the initial FP16 and basic INT8 baselines:
+Implements the FP16, basic INT8, and vector-wise INT8 baselines:
 
 - FP16 matrix multiplication using PyTorch.
 - Per-tensor absmax INT8 quantization.
+- Vector-wise absmax INT8 quantization with independent activation-row and weight-column scaling factors.
 - INT8 matrix multiplication with INT32 accumulation using `torch._int_mm()`.
-- Dequantization of INT32 results to FP16.
-- Numerical validation against an FP32 reference using mean absolute and relative error.
-- CUDA event benchmarking for FP16 GEMM, INT8 GEMM, and the full INT8 pipeline.
-- FP16 versus INT8 weight storage comparisons.
-- Optional synthetic outlier injection.
+- Dequantization of INT32 results to FP16 using the corresponding scaling factors.
+- Numerical validation against an FP32 reference using mean absolute error, mean relative error, and relative L2 error.
+- CUDA event benchmarking for FP16 GEMM, INT8 GEMM, and complete INT8 pipelines.
+- Separate timing measurements for vector-wise quantization, INT8 GEMM, and dequantization.
+- FP16 versus INT8 weight storage comparisons, including vector-wise scaling-factor overhead.
+- Synthetic input tests with varying row/column magnitudes and zero-valued rows/columns.
+- Optional synthetic outlier injection for later mixed-precision decomposition experiments.
 
 ### CUDA C++ (`src/cuda_matmul_baseline.cpp`)
 
@@ -104,6 +107,12 @@ Additional benchmark options:
 # Run a smaller benchmark
 python src/main.py --quick
 
+# Test different activation-row and weight-column magnitudes
+python src/main.py --quick --varying-scales
+
+# Test zero-valued activation rows and weight columns
+python src/main.py --quick --zero-row-column
+
 # Test with synthetic outliers
 python src/main.py --outliers
 
@@ -138,22 +147,104 @@ The current CUDA program performs naive FP32 matrix multiplication on square mat
 
 ## Preliminary Benchmark Results
 
-Results obtained on the NVIDIA RTX 2000 Ada Generation GPU using the Python/PyTorch implementation.
+Benchmark environment:
 
-| Matrix (M, K, N) | FP16 GEMM (ms) | INT8 GEMM (ms) | Full INT8 (ms) |
+- GPU: NVIDIA RTX 2000 Ada Generation
+- PyTorch: 2.15.0+cu132
+- CUDA: 13.2
+- Default benchmark: 10 warmup iterations and 40 timed iterations
+- Random seed: 479
+
+### Execution Time
+
+All times are measured in milliseconds using CUDA events.
+
+| Matrix (M, K, N) | FP16 GEMM | INT8 GEMM | Full INT8 | Vector-wise GEMM | Full Vector-wise |
+|---|---:|---:|---:|---:|---:|
+| 64, 768, 3072 | 0.0242 | 0.0227 | 0.2582 | 0.0227 | 0.2653 |
+| 128, 1024, 4096 | 0.0329 | 0.0571 | 0.7511 | 0.0572 | 0.7676 |
+| 256, 2048, 8192 | 0.2239 | 0.4136 | 4.3688 | 0.3732 | 4.4183 |
+
+GEMM-only measurements exclude quantization and dequantization. Full INT8 pipeline measurements include quantization of both input matrices, INT8 matrix multiplication, and dequantization to FP16.
+
+The complete vector-wise INT8 pipeline is slower than FP16 GEMM for all tested matrix sizes.
+
+### Vector-wise Pipeline Breakdown
+
+| Matrix (M, K, N) | Quantization (ms) | INT8 GEMM (ms) | Dequantization (ms) |
 |---|---:|---:|---:|
-| 64, 768, 3072 | 0.0257 | 0.0227 | 0.2619 |
-| 128, 1024, 4096 | 0.0330 | 0.0571 | 0.7500 |
-| 256, 2048, 8192 | 0.2237 | 0.4171 | 4.3917 |
+| 64, 768, 3072 | 0.2189 | 0.0227 | 0.0142 |
+| 128, 1024, 4096 | 0.6690 | 0.0572 | 0.0257 |
+| 256, 2048, 8192 | 3.8924 | 0.3732 | 0.1832 |
 
-Basic INT8 quantization reduces weight storage by approximately 50%, excluding scaling-factor overhead. However, the full INT8 pipeline is slower than FP16 for all tested matrix sizes and introduces greater numerical error.
+Quantization accounts for approximately 83–88% of the measured full-pipeline execution time across the tested matrix sizes.
 
-These preliminary results motivate further investigation into quantization precision and CUDA optimization.
+These results indicate that quantization overhead is a major performance bottleneck and a potential target for future CUDA optimization.
+
+The current implementation requantizes weights on every invocation. Prequantizing and reusing weights could reduce this overhead in a practical inference implementation.
+
+### Numerical Accuracy
+
+Outputs are compared against an FP32 matrix multiplication reference calculated from the same FP16 inputs.
+
+| Matrix (M, K, N) | Per-tensor INT8 Relative L2 | Vector-wise INT8 Relative L2 |
+|---|---:|---:|
+| 64, 768, 3072 | 0.015593 | 0.010818 |
+| 128, 1024, 4096 | 0.015884 | 0.011146 |
+| 256, 2048, 8192 | 0.016500 | 0.011689 |
+
+Vector-wise quantization reduced relative L2 error by approximately 29–31% compared with per-tensor INT8 quantization across all three matrix sizes.
+
+### Varying-Scales Experiment
+
+To evaluate the effect of independent scaling factors, activation rows and weight columns were assigned different magnitudes using logarithmically spaced scaling factors.
+
+Results for matrix dimensions (64, 768, 3072):
+
+| Metric | Per-tensor INT8 | Vector-wise INT8 |
+|---|---:|---:|
+| Mean absolute error | 7.56592 | 1.12593 |
+| Mean relative error | 2.17849 | 0.08161 |
+| Relative L2 error | 0.039327 | 0.010680 |
+
+Vector-wise quantization reduced relative L2 error by approximately 72.8% and mean absolute error by approximately 85.1% compared with per-tensor quantization.
+
+This demonstrates the benefit of independently quantizing activation rows and weight columns when their magnitudes differ substantially.
+
+### Numerical Validation
+
+The vector-wise implementation was validated using:
+
+- Normally distributed random matrices.
+- Matrices with varying activation-row and weight-column magnitudes.
+- Matrices containing zero-valued activation rows and weight columns.
+
+Validation checks confirm:
+
+- Correct activation-row and weight-column scaling dimensions.
+- INT8 quantized operands and INT32 accumulation.
+- FP16 output dimensions and datatype.
+- Finite scaling factors and output values.
+- Correct zero-output behavior for zero-valued rows and columns.
+
+### Weight Storage
+
+| Matrix (M, K, N) | FP16 Weights | Per-tensor INT8 | Vector-wise INT8 |
+|---|---:|---:|---:|
+| 64, 768, 3072 | 4.50 MiB | 2.25 MiB | 2.26 MiB |
+| 128, 1024, 4096 | 8.00 MiB | 4.00 MiB | 4.02 MiB |
+| 256, 2048, 8192 | 32.00 MiB | 16.00 MiB | 16.03 MiB |
+
+Vector-wise INT8 weight storage includes the FP32 scaling factors for each weight column.
+
+INT8 weight storage is approximately half that of FP16 weights, with a small additional cost for scaling factors.
+
+These values represent weight storage only and do not include activation tensors, intermediate buffers, or peak GPU memory usage.
 
 ## Development Roadmap
 
 - [x] Implement FP16 and basic INT8 baselines (PyTorch)
-- [ ] Implement and validate vector-wise quantization
+- [x] Implement and validate vector-wise quantization
 - [ ] Implement and validate mixed-precision decomposition
 - [ ] Profile and optimize CUDA operations
 - [ ] Complete performance and accuracy evaluation
