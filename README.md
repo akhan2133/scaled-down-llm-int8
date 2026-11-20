@@ -15,7 +15,7 @@ python src/main.py
 
 This project explores the performance, memory efficiency, and numerical accuracy of INT8 matrix multiplication for transformer inference on NVIDIA RTX 2000 Ada GPUs.
 
-We aim to implement the two main components of LLM.int8():
+We have implemented the two main components of LLM.int8():
 
 - **Vector-wise quantization:** Independently quantizing activation rows and weight columns using separate scaling factors.
 - **Mixed-precision decomposition:** Separating outlier feature dimensions for FP16 computation while performing the remaining matrix multiplication in INT8.
@@ -26,7 +26,7 @@ We will then investigate CUDA optimizations to reduce overhead from quantization
 
 ### Python / PyTorch (`src/main.py`)
 
-Implements the FP16, basic INT8, and vector-wise INT8 baselines:
+Implements the FP16, basic INT8, vector-wise INT8, and mixed-precision LLM.int8() baselines:
 
 - FP16 matrix multiplication using PyTorch.
 - Per-tensor absmax INT8 quantization.
@@ -38,7 +38,13 @@ Implements the FP16, basic INT8, and vector-wise INT8 baselines:
 - Separate timing measurements for vector-wise quantization, INT8 GEMM, and dequantization.
 - FP16 versus INT8 weight storage comparisons, including vector-wise scaling-factor overhead.
 - Synthetic input tests with varying row/column magnitudes and zero-valued rows/columns.
-- Optional synthetic outlier injection for later mixed-precision decomposition experiments.
+- Optional synthetic outlier injection for mixed-precision decomposition experiments.
+- Detection of outlier feature dimensions in the activation matrix using an absolute-magnitude threshold of `6.0`.
+- Separation of regular and outlier contributions by zero-masking outlier dimensions before vector-wise INT8 quantization. The regular INT8 matrices retain their original dimensions.
+- FP16 matrix multiplication for the detected outlier activation columns and corresponding weight rows.
+- Combination of the regular INT8 result and FP16 outlier result into an FP16 output.
+- Numerical validation of the decomposition against the FP32 reference, with deterministic tests for no outliers, positive/negative outliers, multiple outliers, zero-valued rows/columns, and all-outlier dimensions.
+- CUDA event timings for outlier detection, decomposition, the regular INT8 pipeline, outlier FP16 GEMM, output combination, and the complete mixed-precision pipeline.
 
 ### CUDA C++ (`src/cuda_matmul_baseline.cpp`)
 
@@ -59,13 +65,14 @@ LLM-int8/
 ├── requirements.txt
 ├── setup.sh
 ├── include/
-    └── kernels.h
+│   └── kernels.h
 ├── python/
-    ├── cuda_bindings.cpp
-    └── extension.py
+│   ├── bindings.cpp
+│   ├── cuda_extension.py
+│   └── test_extension.py
 └── src/
     ├── kernels/
-        └── gemm_naive.cu
+    │   └── gemm_naive.cu
     ├── cuda_matmul_baseline.cpp
     └── main.py
 ```
@@ -118,7 +125,15 @@ python src/main.py --outliers
 
 # Adjust benchmarking repetitions
 python src/main.py --warmup 10 --repeat 100
+
+#  Run six deterministic mixed-precision correctness tests
+python src/main.py --self-test
+
+# Test outliers together with zero-valued rows and columns
+python src/main.py --quick --outliers --zero-row-column
 ```
+
+Running `python src/main.py` benchmarks all three matrix sizes with default random inputs. It does **not** automatically run `--self-test` or the special `--outliers`, `--varying-scales`, and `--zero-row-column` configurations; those must be run separately.
 
 **Note:** The INT8 implementation uses PyTorch's internal `torch._int_mm()` API and requires a compatible CUDA-enabled PyTorch build.
 
@@ -241,11 +256,51 @@ INT8 weight storage is approximately half that of FP16 weights, with a small add
 
 These values represent weight storage only and do not include activation tensors, intermediate buffers, or peak GPU memory usage.
 
+### Mixed-Precision Decomposition
+
+The mixed-precision implementation was evaluated using synthetic activation matrices containing one controlled outlier feature dimension. Running `python src/main.py --outliers` sets activation column 0 to `40.0`, exceeding the default outlier threshold of `6.0`. The implementation correctly identified this dimension and computed its contribution separately in FP16.
+
+**Execution time with injected outliers:**
+
+| Matrix (M, K, N) | FP16 GEMM (ms) | Full vector-wise (ms) | Full mixed-precision (ms) |
+|---|---:|---:|---:|
+| 64, 768, 3072 | 0.0242 | 0.2684 | 0.3709 |
+| 128, 1024, 4096 | 0.0332 | 0.7513 | 0.8947 |
+| 256, 2048, 8192 | 0.2196 | 4.4109 | 5.3309 |
+
+The unoptimized mixed-precision pipeline is slower than vector-wise INT8, primarily because of the additional decomposition and intermediate operations. Full-pipeline measurements include quantization of both input matrices, whereas the FP16 GEMM measurement does not include preprocessing.
+
+**Numerical accuracy with injected outliers (relative L2 error vs FP32):**
+
+| Matrix (M, K, N) | Vector-wise INT8 | Mixed-precision INT8 | Error reduction |
+|---|---:|---:|---:|
+| 64, 768, 3072 | 0.0526214 | 0.00621864 | 88.2% |
+| 128, 1024, 4096 | 0.0574809 | 0.00698525 | 87.8% |
+| 256, 2048, 8192 | 0.0685545 | 0.00874458 | 87.2% |
+
+Mixed-precision decomposition reduced relative L2 error by approximately 87–88% compared with vector-wise INT8 for these controlled synthetic-outlier inputs.
+
+**Mixed-precision pipeline breakdown:**
+
+| Matrix (M, K, N) | Detection (ms) | Decomposition (ms) | Regular INT8 (ms) | FP16 outlier GEMM (ms) | Combination (ms) |
+|---|---:|---:|---:|---:|---:|
+| 64, 768, 3072 | 0.0109 | 0.0652 | 0.2676 | 0.0054 | 0.0132 |
+| 128, 1024, 4096 | 0.0107 | 0.0856 | 0.7514 | 0.0058 | 0.0203 |
+| 256, 2048, 8192 | 0.0110 | 0.7161 | 4.4116 | 0.0128 | 0.1703 |
+
+The stages were benchmarked independently, so their times do not necessarily sum to the full-pipeline time. The regular INT8 pipeline remains the largest cost, while the FP16 outlier GEMM itself is relatively inexpensive.
+
+**Validation:** All six deterministic `--self-test` cases passed: no outliers, one positive outlier, three outliers, one negative outlier, a zero-valued row/column, and all-outlier dimensions. Without injected outliers, mixed precision produced the same relative L2 error as vector-wise INT8 (`0.0108182` for the smallest shape). The combined `--quick --outliers --zero-row-column` test also completed successfully.
+
+**Estimated weight storage with one injected outlier:** 2.27 MiB, 4.02 MiB, and 16.05 MiB for the three matrix sizes, respectively. These estimates include the INT8 weight representation, vector-wise scaling factors, and FP16 outlier weight rows; they do not represent measured peak GPU memory use or include original FP16 weights retained during benchmarking.
+
+These experiments validate the scaled-down matrix-multiplication implementation on synthetic inputs. They do not measure full-transformer accuracy or end-to-end model inference performance.
+
 ## Development Roadmap
 
 - [x] Implement FP16 and basic INT8 baselines (PyTorch)
 - [x] Implement and validate vector-wise quantization
-- [ ] Implement and validate mixed-precision decomposition
+- [x] Implement and validate mixed-precision decomposition
 - [ ] Profile and optimize CUDA operations
 - [ ] Complete performance and accuracy evaluation
 - [ ] Finalize report, presentation, and code
